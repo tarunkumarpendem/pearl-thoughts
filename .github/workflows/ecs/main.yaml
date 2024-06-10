@@ -1,0 +1,121 @@
+---
+name: Deploy Hello World nodejs code to ECS using terraform
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+    pull_request:
+      branches:
+        - main
+    workflow_dispatch:
+    inputs:
+      workflow_file:
+        description: 'Path to the workflow file'
+        required: true
+        default: '/ecs/main.yaml'
+
+jobs:
+  get_environment_name_from_git_ref:
+    name: Get Environment Name From Git Ref
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setting Environment Name Dynamically
+        id: setenv
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/develop" || "${{ github.base_ref }}" == "develop" ]]; then
+            echo "env=dev" >> $GITHUB_OUTPUT
+            echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_OUTPUT
+            echo "REPO_NAME=${{ github.event.repository.name }}" >> $GITHUB_OUTPUT
+          fi
+          if [[ "${{ github.ref }}" == "refs/heads/main" || "${{ github.base_ref }}" == "main" ]]; then
+            echo "env=production" >> $GITHUB_OUTPUT
+            echo "IMAGE_TAG=production-${{ github.sha }}" >> $GITHUB_OUTPUT
+            echo "REPO_NAME=${{ github.event.repository.name }}" >> $GITHUB_OUTPUT
+          fi
+
+    outputs:
+      env: ${{ steps.setenv.outputs.env }}
+      image_tag: ${{ steps.setenv.outputs.IMAGE_TAG }}
+      repo_name: ${{ steps.setenv.outputs.REPO_NAME }}
+
+
+  build:
+    name: Building the ${{ needs.get_environment_name_from_git_ref.outputs.repo_name }} Docker Image
+    runs-on: ubuntu-22.04
+    needs: [ get_environment_name_from_git_ref ]
+    environment: ${{ needs.get_environment_name_from_git_ref.outputs.env }}
+    env:
+      IMAGE_NAME: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ needs.get_environment_name_from_git_ref.outputs.repo_name }}
+      IMAGE_TAG: ${{ needs.get_environment_name_from_git_ref.outputs.image_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Configure AWS credentials
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws configure set default.region ${{ vars.AWS_REGION }}
+          aws s3 ls
+
+      - name: Login to ECR
+        run: aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com
+
+      - name: Build and push Docker image to ECR
+        run: |
+          docker build -t $IMAGE_NAME:$IMAGE_TAG .
+          docker push $IMAGE_NAME:$IMAGE_TAG
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service --cluster my-cluster --service my-service --force-new-deployment --region us-west-2 --task-definition my-task-definition --container-name my-container --image $AWS_ACCOUNT_ID.dkr.ecr.us-west-2.amazonaws.com/my-repo:$GITHUB_SHA
+
+      
+  deploy:
+    name: Deploy Docker Image to ECS
+    runs-on: ubuntu-22.04
+    needs: [ get_environment_name_from_git_ref ]
+    environment: ${{ needs.get_environment_name_from_git_ref.outputs.env }}
+    env:
+      IMAGE_NAME: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ needs.get_environment_name_from_git_ref.outputs.repo_name }}
+      IMAGE_TAG: ${{ needs.get_environment_name_from_git_ref.outputs.image_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Configure AWS credentials
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws configure set default.region ${{ vars.AWS_REGION }}
+          aws s3 ls
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 1.8.5
+
+      - name: Terraform Init
+        run: |
+          cd terraform/ECS
+          terraform init
+
+      - name: Terraform validate and format
+        run: |
+          cd terraform/ECS
+          terraform validate && terraform fmt
+
+      - name: Terraform Plan
+        run: |
+          cd terraform/ECS
+          terraform plan
+
+      - name: Terraform Apply
+        run: |
+          cd terraform/ECS
+          terraform apply -auto-approve
